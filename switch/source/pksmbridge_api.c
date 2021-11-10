@@ -1,6 +1,6 @@
 /*
  *   This file is part of Checkpoint
- *   Copyright (C) 2017-2021 Bernardo Giordano, FlagBrew
+ *   Copyright (C) 2016-2021 mrhappyasthma, Flagbrew
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -24,13 +24,28 @@
  *         reasonable ways as different from the original version.
  */
 
-#include "account.hpp"
+#include "pksmbridge_api.h"
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 
-#include <string>
-#include <tuple>
+const int PKSM_BRIDGE_UNSUPPORTED_PROTOCOL_VERSION = -1;
 
-#define PKSM_PORT 34567
+struct pksmBridgeRequest createPKSMBridgeRequest(int protocol_version)
+{
+    struct pksmBridgeRequest request;
+    memcpy(request.protocol_name, PKSM_BRIDGE_PROTOCOL_NAME, sizeof(request.protocol_name) / sizeof(request.protocol_name[0]));
+    request.protocol_version = protocol_version;
+    return request;
+}
 
-bool isPKSMBridgeTitle(u64 id);
-std::tuple<bool, Result, std::string> sendToPKSMBridge(size_t index, AccountUid uid, size_t cellIndex);
-std::tuple<bool, Result, std::string> recvFromPKSMBridge(size_t index, AccountUid uid, size_t cellIndex);
+struct pksmBridgeResponse createPKSMBridgeResponseForRequest(struct pksmBridgeRequest request, bool (*supportedProtocolVersionsFunc)(int version))
+{
+    struct pksmBridgeResponse response;
+    memcpy(response.protocol_name, PKSM_BRIDGE_PROTOCOL_NAME, sizeof(response.protocol_name) / sizeof(response.protocol_name[0]));
+    response.protocol_version = request.protocol_version;
+    if (!supportedProtocolVersionsFunc(request.protocol_version)) {
+        response.protocol_version = PKSM_BRIDGE_UNSUPPORTED_PROTOCOL_VERSION;
+    }
+    return response;
+}

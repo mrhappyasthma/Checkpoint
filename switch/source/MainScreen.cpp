@@ -456,7 +456,7 @@ void MainScreen::handleEvents(const InputState& input)
                     currentOverlay = std::make_shared<YesNoOverlay>(
                         *this, "Send save to PKSM?",
                         [this]() {
-                            auto result = sendToPKSMBrigde(this->index(TITLES), g_currentUId, this->index(CELLS));
+                            auto result = sendToPKSMBridge(this->index(TITLES), g_currentUId, this->index(CELLS));
                             if (std::get<0>(result)) {
                                 currentOverlay = std::make_shared<InfoOverlay>(*this, std::get<2>(result));
                             }

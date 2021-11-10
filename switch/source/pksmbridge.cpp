@@ -25,36 +25,75 @@
  */
 
 #include "pksmbridge.hpp"
+#include "KeyboardManager.hpp"
+#include "pksmbridge_api.h"
+#include "pksmbridge_tcp.h"
+#include "title.hpp"
+#include <errno.h>
+#include <string.h>
 
-static bool isLGPE(u64 id)
-{
-    return id == 0x0100187003A36000 || id == 0x010003F003A34000;
-}
+namespace {
 
-static bool isSWSH(u64 id)
-{
-    return id == 0x0100ABF008968000 || id == 0x01008DB008C2C000;
-}
+    bool isLGPE(u64 id) { return id == 0x0100187003A36000 || id == 0x010003F003A34000; }
+
+    bool isSWSH(u64 id) { return id == 0x0100ABF008968000 || id == 0x01008DB008C2C000; }
+
+    bool validateIpAddress(const std::string& ip)
+    {
+        struct sockaddr_in sa;
+        return inet_pton(AF_INET, ip.c_str(), &sa.sin_addr) != 0;
+    }
+
+    bool verifyPKSMBridgeFileSHA256Checksum(struct pksmBridgeFile file)
+    {
+        if (file.checksumSize != SHA256_HASH_SIZE) {
+            return false;
+        }
+        unsigned char* checksum = (unsigned char*)malloc(file.checksumSize);
+        sha256CalculateHash(checksum, file.contents, file.size);
+        int result = memcmp(checksum, file.checksum, file.checksumSize);
+        free(checksum);
+        return (result == 0) ? true : false;
+    }
+
+    std::tuple<bool, Result, std::string> outputTupleFromError(enum pksmBridgeError error)
+    {
+        switch (error) {
+            case PKSM_BRIDGE_ERROR_NONE:
+                return std::make_tuple(true, 0, "Data sent correctly.");
+            case PKSM_BRIDGE_ERROR_UNSUPPORTED_PROTCOL_VERSION:
+                return std::make_tuple(false, errno, "Unsupported PKSM Bridge protocol version.");
+            case PKSM_BRIDGE_ERROR_CONNECTION_ERROR:
+                return std::make_tuple(false, errno, "Socket connection failed.");
+            case PKSM_BRIDGE_DATA_READ_FAILURE:
+                return std::make_tuple(false, errno, "Failed to receive data.");
+            case PKSM_BRIDGE_DATA_WRITE_FAILURE:
+                return std::make_tuple(false, errno, "Failed to send data.");
+            case PKSM_BRIDGE_DATA_FILE_CORRUPTED:
+                return std::make_tuple(false, errno, "Transfer failed. File data corrupted.");
+            case PKSM_BRIDGE_ERROR_UNEXPECTED_MESSAGE:
+                return std::make_tuple(false, errno, "Unexpected message received over PKSM Bridge.");
+            default:
+                char buffer[50];
+                sprintf(buffer, "Unhandled PKSM Bridge error occurred: %d", error);
+                return std::make_tuple(false, errno, std::string(buffer));
+        }
+    }
+
+} // namespace
 
 bool isPKSMBridgeTitle(u64 id)
 {
     return isLGPE(id) || isSWSH(id);
 }
 
-bool validateIpAddress(const std::string& ip)
-{
-    struct sockaddr_in sa;
-    return inet_pton(AF_INET, ip.c_str(), &sa.sin_addr) != 0;
-}
-
-std::tuple<bool, Result, std::string> sendToPKSMBrigde(size_t index, AccountUid uid, size_t cellIndex)
+std::tuple<bool, Result, std::string> sendToPKSMBridge(size_t index, AccountUid uid, size_t cellIndex)
 {
     auto systemKeyboardAvailable = KeyboardManager::get().isSystemKeyboardAvailable();
     if (!systemKeyboardAvailable.first) {
         return std::make_tuple(false, systemKeyboardAvailable.second, "System keyboard not accessible.");
     }
 
-    // load data
     Title title;
     getTitle(title, uid, index);
     std::string filename;
@@ -62,159 +101,77 @@ std::tuple<bool, Result, std::string> sendToPKSMBrigde(size_t index, AccountUid 
         filename = "/savedata.bin";
     }
     else if (isSWSH(title.id())) {
+        // Sword and Shield actually uses the 'backup' file as the canonical one.
         filename = "/backup";
     }
     else {
         return std::make_tuple(false, systemKeyboardAvailable.second, "Invalid title.");
     }
-
     std::string srcPath = title.fullPath(cellIndex) + filename;
     FILE* save          = fopen(srcPath.c_str(), "rb");
     if (save == NULL) {
         return std::make_tuple(false, systemKeyboardAvailable.second, "Failed to open source file.");
     }
-
     fseek(save, 0, SEEK_END);
-    size_t size = ftell(save);
+    uint32_t size = ftell(save);
     rewind(save);
-    char* data = new char[size];
+    uint8_t* data = new uint8_t[size];
     fread(data, 1, size, save);
     fclose(save);
 
-    // get server address
     auto ipaddress = KeyboardManager::get().keyboard("Input PKSM IP address");
     if (!ipaddress.first || !validateIpAddress(ipaddress.second)) {
         delete[] data;
         return std::make_tuple(false, -1, "Invalid IP address.");
     }
 
-    // send via TCP
-    int fd;
-    struct sockaddr_in servaddr;
-    if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        delete[] data;
-        return std::make_tuple(false, errno, "Socket creation failed.");
-    }
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sin_family      = AF_INET;
-    servaddr.sin_port        = htons(PKSM_PORT);
-    servaddr.sin_addr.s_addr = inet_addr(ipaddress.second.c_str());
-
-    if (connect(fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
-        close(fd);
-        delete[] data;
-        return std::make_tuple(false, errno, "Socket connection failed.");
-    }
-
-    size_t total = 0;
-    size_t chunk = 1024;
-    while (total < size) {
-        size_t tosend = size - total > chunk ? chunk : size - total;
-        int n         = send(fd, data + total, tosend, 0);
-        if (n == -1) {
-            break;
-        }
-        total += n;
-        fprintf(stderr, "Sent %lu bytes, %lu still missing\n", (unsigned long)total, (unsigned long)(size - total));
-    }
-
-    close(fd);
+    unsigned char checksum[SHA256_HASH_SIZE];
+    sha256CalculateHash(checksum, data, size);
+    uint32_t checksumSize      = sizeof(checksum) / sizeof(checksum[0]);
+    struct pksmBridgeFile file = {.checksumSize = checksumSize, .checksum = checksum, size = size, .contents = data};
+    struct in_addr address     = {.s_addr = inet_addr(ipaddress.second.c_str())};
+    enum pksmBridgeError error = sendFileOverPKSMBridgeViaTCP(PKSM_PORT, address, file);
     delete[] data;
-
-    if (total == size) {
-        return std::make_tuple(true, 0, "Data sent correctly.");
-    }
-    else {
-        return std::make_tuple(false, errno, "Failed to send data.");
-    }
+    return outputTupleFromError(error);
 }
 
 std::tuple<bool, Result, std::string> recvFromPKSMBridge(size_t index, AccountUid uid, size_t cellIndex)
 {
-    int fd;
-    struct sockaddr_in servaddr;
-    if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP)) < 0) {
-        Logger::getInstance().log(Logger::ERROR, "Socket creation failed: %d.", fd);
-        return std::make_tuple(false, errno, "Socket creation failed.");
+    uint8_t* file = nullptr;
+    uint32_t fileSize;
+    enum pksmBridgeError error = receiveFileOverPKSMBridgeViaTCP(PKSM_PORT, NULL, &file, &fileSize, &verifyPKSMBridgeFileSHA256Checksum);
+
+    std::tuple<bool, Result, std::string> result = outputTupleFromError(error);
+    if (error != PKSM_BRIDGE_ERROR_NONE) {
+        free(file);
+        Logger::getInstance().log(Logger::ERROR, std::get<2>(result));
+        return result;
     }
 
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sin_family      = AF_INET;
-    servaddr.sin_port        = htons(PKSM_PORT);
-    servaddr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
-        close(fd);
-        Logger::getInstance().log(Logger::ERROR, "Socket bind failed with errno %d.", errno);
-        return std::make_tuple(false, errno, "Socket bind failed.");
-    }
-    if (listen(fd, 5) < 0) {
-        close(fd);
-        Logger::getInstance().log(Logger::ERROR, "Socket listen failed with errno %d.", errno);
-        return std::make_tuple(false, errno, "Socket listen failed.");
-    }
-
-    int fdconn;
-    int addrlen = sizeof(servaddr);
-    if ((fdconn = accept(fd, (struct sockaddr*)&servaddr, (socklen_t*)&addrlen)) < 0) {
-        close(fd);
-        Logger::getInstance().log(Logger::ERROR, "Socket accept failed: %d.", fdconn);
-        return std::make_tuple(false, errno, "Socket accept failed.");
-    }
-
-    size_t size;
     Title title;
     getTitle(title, uid, index);
     std::string filename;
     if (isLGPE(title.id())) {
         filename = "/savedata.bin";
-        size     = 0x100000;
     }
     else if (isSWSH(title.id())) {
+        // Sword and Shield actually uses the 'backup' file as the canonical one.
         filename = "/backup";
-        size     = 0x180B19;
     }
     else {
         filename = "DEFAULT";
-        // WHAT DO WE DO ABOUT SIZE?
     }
     std::string srcPath = title.fullPath(cellIndex) + filename;
     FILE* save          = fopen(srcPath.c_str(), "wb");
     if (save == NULL) {
-        close(fd);
-        close(fdconn);
+        free(file);
         Logger::getInstance().log(Logger::ERROR, "Failed to open destination file with errno %d.", errno);
         return std::make_tuple(false, errno, "Failed to open destination file.");
     }
 
-    char* data = new char[size]();
-
-    size_t total = 0;
-    size_t chunk = 1024;
-    while (total < size) {
-        size_t torecv = size - total > chunk ? chunk : size - total;
-        int n         = recv(fdconn, data + total, torecv, 0);
-        if (n == -1) {
-            break;
-        }
-        total += n;
-        fprintf(stderr, "Recv %lu bytes, %lu still missing\n", (unsigned long)total, (unsigned long)(size - total));
-    }
-
-    close(fd);
-    close(fdconn);
-
-    if (total == size) {
-        fwrite(data, 1, size, save);
-        fclose(save);
-        delete[] data;
-        Logger::getInstance().log(Logger::INFO, "pksmbridge data received correctly.");
-        return std::make_tuple(true, 0, "Data received correctly.");
-    }
-    else {
-        fclose(save);
-        delete[] data;
-        Logger::getInstance().log(Logger::ERROR, "Failed to receive pksmbridge data.");
-        return std::make_tuple(false, errno, "Failed to receive data.");
-    }
+    fwrite(file, sizeof(file[0]), fileSize, save);
+    fclose(save);
+    free(file);
+    Logger::getInstance().log(Logger::ERROR, std::get<2>(result));
+    return result;
 }
